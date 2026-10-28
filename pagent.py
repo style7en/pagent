@@ -38,7 +38,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.6"
+VERSION = "0.0.7"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
@@ -198,8 +198,8 @@ def _usage(usage, in_chars, out_chars):
     _USAGE["out"] += out_chars // CHARS_PER_TOKEN
 
 
-def _tok(n):
-    return "%.1fk" % (n / 1000.0) if n >= 1000 else str(n)
+def _tok(n, force_k=False):
+    return "%.1fk" % (n / 1000.0) if force_k or n >= 1000 else str(n)
 
 
 def _fixed_chars(cfg):
@@ -217,13 +217,14 @@ def _ctx_line(messages, cfg):
     """当前对话占用上下文的百分比（按字符估算，口径与 trim() 一致）。"""
     ctx, out = cfg["context"], cfg["max_output"]
     if not messages:
-        return "上下文   : 窗口 %d tokens · 最大输出 %d" % (ctx, out)
+        return "上下文   : 窗口 %s tokens · 最大输出 %s" % (_tok(ctx, True), _tok(out, True))
     used = (_chars(messages) + _fixed_chars(cfg)) // CHARS_PER_TOKEN
     cap = _budget(cfg) // CHARS_PER_TOKEN
     pct = used * 100.0 / ctx if ctx > 0 else 0.0
     note = "，已触发裁剪" if used >= cap else ""
-    return "上下文   : 已用 %s / %d tokens（%s%%）· 裁剪阈值 %s%s · 最大输出 %d" % (
-        _tok(used), ctx, "%.2f" % pct if pct < 1 else "%.1f" % pct, _tok(cap), note, out)
+    return "上下文   : 已用 %s，%s tokens（%s%%）· 裁剪阈值 %s%s · 最大输出 %s" % (
+        _tok(used, True), _tok(ctx, True),
+        "%.2f" % pct if pct < 1 else "%.1f" % pct, _tok(cap, True), note, _tok(out, True))
 
 
 def _usage_line():
