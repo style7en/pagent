@@ -16,7 +16,8 @@
 
 ## 要求
 
-- Python 3.8+（无第三方依赖）
+- Python 3.6+（无第三方依赖）。只用标准库，且避开了 3.7 才有的
+  `capture_output`、`str.isascii`、`sys.stdout.reconfigure`
 - 一个 OpenAI 兼容的接口地址和 API Key
 
 ## 快速开始

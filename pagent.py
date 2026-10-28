@@ -40,7 +40,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.14"
+VERSION = "0.0.15"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
@@ -151,7 +151,7 @@ def _clean(s):
     而不是一个字符；拼接后既打印不出也 encode 不了，回传时直接抛
     UnicodeEncodeError: surrogates not allowed。这里把它们合回真正的字符。
     """
-    if not s or s.isascii():
+    if not s or max(s) < "\x80":   # 纯 ASCII 直接放行（max 比 isascii 老，3.6 也能跑）
         return s
     out, i, n = [], 0, len(s)
     while i < n:
@@ -414,7 +414,7 @@ def _kill_tree(proc):
     with suppress(Exception):
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=10)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     with suppress(Exception):
