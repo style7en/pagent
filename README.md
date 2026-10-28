@@ -1,12 +1,12 @@
 # pagent
 
-一个零依赖的命令行编程 Agent，单文件 900 余行，只依赖 Python 标准库。
+一个零依赖的命令行编程 Agent，单文件 1000 余行，只依赖 Python 标准库。
 对接任意 OpenAI 兼容的 `/chat/completions` 接口，能读写文件、执行命令。
 
 ```
 > 帮我把 utils.py 里的重复函数合并一下
 → read_file {"path": "utils.py"}
-→ shell {"command": "grep -n 'def ' utils.py"}
+→ edit_file {"path": "utils.py", "old_string": "def _parse_a(x):", "new_string": "def _parse(x):"}
 ...
 改完了：合并了 3 个重复的 _parse 函数，删掉了 42 行冗余代码。
 ```
@@ -69,7 +69,7 @@ echo "这个项目是做什么的？" | python pagent.py
 
 | 命令 | 作用 |
 |---|---|
-| `/status` | 查看当前配置 |
+| `/status` | 查看当前配置与本次会话的 token 用量 |
 | `/reset` | 清空对话历史 |
 | `/tools` | 列出可用工具 |
 | `/exit` | 退出（`/quit`、`/q` 同义） |
@@ -80,9 +80,21 @@ echo "这个项目是做什么的？" | python pagent.py
 | 工具 | 说明 |
 |---|---|
 | `shell` | 执行 shell 命令，返回 stdout/stderr/退出码；超时会杀掉整个进程树 |
-| `read_file` | 分片读文件，每次最多 8KB，返回续读 offset |
+| `read_file` | 分片读文件，每次最多 8KB，输出带行号前缀，返回续读 offset |
+| `edit_file` | 精确替换：`old_string` → `new_string`，要求原文唯一，否则报错不写盘 |
 | `write_file` | 写文件，支持覆盖/追加，父目录自动创建 |
 | `list_dir` | 列目录，目录在前 |
+
+`read_file` 的输出形如：
+
+```
+   44→ CHUNK = 8192             # read_file 分片字节数
+   45→ QUIT_AT = 3              # 连按几次 Ctrl+C 才退出
+```
+
+行号只为定位，**不属于文件内容**，喂给 `edit_file` 的 `old_string` 不要带行号。
+改已有文件优先用 `edit_file`，只替换需要改的那一小段，比整文件重写省几十倍 token，
+也不会误伤文件其它部分。新建文件或整篇重写才用 `write_file`。
 
 ## 安全策略
 
@@ -96,7 +108,7 @@ echo "这个项目是做什么的？" | python pagent.py
 
 文件工具的路径被限制在工作目录内（`--allow-outside` 可放开）。
 
-> 注意：`shell` 本身不受路径沙箱约束，沙箱只管三个文件工具。高危识别是静态规则，
+> 注意：`shell` 本身不受路径沙箱约束，沙箱只管四个文件工具。高危识别是静态规则，
 > `python -c "import shutil; shutil.rmtree('.')"` 这类藏在解释器里的调用判断不出来。
 > 需要强隔离请用容器或降权运行。
 
@@ -107,6 +119,8 @@ echo "这个项目是做什么的？" | python pagent.py
 - **重试**：指数退避 + ±40% 随机抖动（1、2、4、8、16、32、60 秒封顶），
   优先采纳服务端返回的 `Retry-After`。429 默认给到 8 次机会。
 - **编码**：子进程输出按 utf-8 → 系统编码 → gbk 依次尝试解码，中文 Windows 不乱码。
+- **用量统计**：累计每次请求的输入/输出 token（服务端返回 `usage` 就用真实值，
+  流式响应没带时按字符数估算并标注），`/status` 里查看。
 
 ## 已知限制
 

@@ -42,7 +42,7 @@ KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留�
 KEEP_TOOL_CHARS_MIN = 400  # 压缩下限，保证工具结果仍有可用信息
 CHARS_PER_TOKEN = 3      # 1 token ≈ 3 字符（中英混合，偏保守）
 CHUNK = 8192             # read_file 分片字节数（默认=上限）
-QUIT_AT = 3              # 连按几次 Ctrl+C 才退出
+QUIT_AT = 3              # 连按几次 Ctrl+C 才退出（QUIT_AT）
 
 # 重试退避（指数 + 抖动）：1, 2, 4, 8, 16, 32, 60... 秒
 RETRY_BASE = 1.0         # 首次退避基准秒数
@@ -54,9 +54,14 @@ RETRY_AFTER_MAX = 120.0  # 服务端 Retry-After 的最大采纳值（秒）
 
 DEFAULT_SYSTEM = (
     "你是 pagent，一个极简的命令行编程 Agent。"
-    "你有四个工具：shell(执行命令)、read_file(分片读文件)、write_file(写文件/追加)、list_dir(列目录)。"
-    "read_file 每次最多读 8KB，返回续读 offset；大文件必须逐段读完，不要臆测没读到的部分。"
-    "改已有文件的局部内容：先 read_file 看清原文再 write_file 重写，或用 shell 精确替换；"
+    "你有五个工具：shell(执行命令)、read_file(分片读文件)、edit_file(精确替换)、"
+    "write_file(写文件/追加)、list_dir(列目录)。"
+    "read_file 每次最多读 8KB，返回续读 offset；输出带行号前缀（如 42→ 代码），"
+    "行号只为定位、不属于文件内容，抄进 old_string 时不要带行号。"
+    "改已有文件优先用 edit_file：old_string 必须与原文逐字符一致且在文件中唯一，"
+    "只替换需要改的那一小段，不要整文件重写；匹配不到或不唯一时，重新 read_file "
+    "取更长的上下文再试。新建文件或整篇重写才用 write_file。"
+    "大文件必须逐段读完，不要臆测没读到的部分。"
     "写长内容优先 write_file，不要用 shell 拼接。"
     "文件工具仅限当前工作目录内，越界路径会被拒绝，优先用相对路径。"
     "shell 在本机执行(Linux 走 sh -c，Windows 走 cmd /c)，命令风格按平台写。"
@@ -74,6 +79,7 @@ _TTY = sys.stdout.isatty()
 _AUTO_YES = False
 _ROOT = {"path": os.getcwd(), "jail": True}
 _CTRL_C = {"n": 0}
+_USAGE = {"calls": 0, "in": 0, "out": 0, "est": 0}   # 累计 token 用量（est=估算次数）
 
 
 def _env(name, default=None, kind=str):
@@ -112,6 +118,39 @@ def _clip(text, limit=OUT_LIMIT):
 
 def _err(e):
     return "错误：%s: %s" % (type(e).__name__, e)
+
+
+def _chars(messages):
+    """请求体字符数，服务端不给 usage 时用来估算输入 token。"""
+    return sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
+
+
+def _usage(usage, in_chars, out_chars):
+    """累计 token 用量。服务端回了 usage 就用真实值，否则按字符数估算。"""
+    _USAGE["calls"] += 1
+    p = c = None
+    if isinstance(usage, dict):
+        p, c = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    if isinstance(p, int) and isinstance(c, int):
+        _USAGE["in"] += p
+        _USAGE["out"] += c
+        return
+    _USAGE["est"] += 1
+    _USAGE["in"] += in_chars // CHARS_PER_TOKEN
+    _USAGE["out"] += out_chars // CHARS_PER_TOKEN
+
+
+def _tok(n):
+    return "%.1fk" % (n / 1000.0) if n >= 1000 else str(n)
+
+
+def _usage_line():
+    u = _USAGE
+    if not u["calls"]:
+        return "用量     : 本次会话还没有请求"
+    return "用量     : %d 次请求，输入 %s / 输出 %s tokens%s" % (
+        u["calls"], _tok(u["in"]), _tok(u["out"]),
+        "（其中 %d 次为估算）" % u["est"] if u["est"] else "")
 
 
 # ---------------------------------------------------------------- 路径沙箱
@@ -349,6 +388,30 @@ def _utf8_prefix(raw, cut):
         return raw.decode("utf-8", "replace"), len(raw)
 
 
+def _count_lines(path, upto):
+    """数文件前 upto 字节里有几个换行，用于给分片内容标行号。"""
+    n, left = 0, upto
+    try:
+        with open(path, "rb") as f:
+            while left > 0:
+                block = f.read(min(65536, left))
+                if not block:
+                    break
+                n += block.count(b"\n")
+                left -= len(block)
+    except OSError:
+        return 0
+    return n
+
+
+def _number(text, start):
+    """给文本加行号前缀（42→ ...），末尾换行原样保留。"""
+    tail = "\n" if text.endswith("\n") else ""
+    lines = (text[:-1] if tail else text).split("\n")
+    width = len(str(start + len(lines) - 1))
+    return "\n".join("%*d→ %s" % (width, start + i, ln) for i, ln in enumerate(lines)) + tail
+
+
 def tool_read(a):
     path, err = _resolve(a.get("path", ""))
     if err:
@@ -375,6 +438,8 @@ def tool_read(a):
         raw, offset = raw[skip:], offset + skip
     text, consumed = _utf8_prefix(raw, more)
     end = offset + consumed
+    if text:
+        text = _number(text, _count_lines(path, offset) + 1)
     if more:
         text += "\n...[分片读取：字节 %d-%d / 共 %d，续读请传 offset=%d]" % (offset, end, total, end)
     elif offset:
@@ -407,6 +472,52 @@ def tool_write(a):
                                         "追加" if mode == "append" else "覆盖")
 
 
+def tool_edit(a):
+    """按 old_string → new_string 精确替换，要求 old_string 在文件中唯一。
+
+    比 write_file 重写整篇便宜得多，也不会误伤文件其它部分；
+    唯一性检查是安全底线：匹配到多处就报错让模型补上下文，绝不猜。
+    """
+    path, err = _resolve(a.get("path", ""))
+    if err:
+        return err
+    old, new = a.get("old_string"), a.get("new_string")
+    if not isinstance(old, str) or not old:
+        return "错误：old_string 不能为空"
+    if not isinstance(new, str):
+        return "错误：new_string 必须是字符串（删除内容请传空字符串）"
+    if old == new:
+        return "错误：old_string 与 new_string 相同，无需修改"
+    if not os.path.isfile(path):
+        return "错误：文件不存在 %s（新建请用 write_file）" % path
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+    except UnicodeDecodeError:
+        return "错误：%s 不是 UTF-8 文本，无法按文本编辑" % path
+    except OSError as e:
+        return _err(e)
+    hits = text.count(old)
+    if hits == 0:
+        return ("错误：未找到 old_string。必须与文件内容逐字符一致（含缩进、空行、标点），"
+                "行号前缀不属于文件内容。请重新 read_file 核对后再试。")
+    if hits > 1 and not a.get("replace_all"):
+        return ("错误：old_string 在文件中出现 %d 次，不唯一。请把它扩展成更长的上下文使其唯一，"
+                "或传 replace_all=true 全部替换。" % hits)
+    text = text.replace(old, new) if a.get("replace_all") else text.replace(old, new, 1)
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+    except OSError as e:
+        return _err(e)
+    for ln in old.splitlines()[:4]:
+        print(_dim("  - " + ln[:160]))
+    for ln in new.splitlines()[:4]:
+        print(_dim("  + " + ln[:160]))
+    return "已替换 %d 处，%s 现在共 %d 行" % (hits if a.get("replace_all") else 1, path,
+                                             text.count("\n") + (0 if text.endswith("\n") else 1))
+
+
 def tool_list(a):
     path, err = _resolve(a.get("path", "."))
     if err:
@@ -426,7 +537,7 @@ def tool_list(a):
     return _clip("\n".join(lines) or "（空目录）")
 
 
-TOOL_IMPL = {"shell": tool_shell, "read_file": tool_read,
+TOOL_IMPL = {"shell": tool_shell, "read_file": tool_read, "edit_file": tool_edit,
              "write_file": tool_write, "list_dir": tool_list}
 
 
@@ -440,10 +551,19 @@ TOOLS = [
     _fn("shell", "执行 shell 命令，返回 stdout/stderr/退出码。普通命令直接执行，仅高危命令会请求用户批准。",
         {"command": {"type": "string"},
          "timeout": {"type": "number", "description": "秒，默认 120"}}, ["command"]),
-    _fn("read_file", "分片读取文本文件，每次最多 8KB；按返回的 offset 续读。",
+    _fn("read_file", "分片读取文本文件，每次最多 8KB，输出带行号前缀（42→ 代码，行号不属于文件内容）。"
+                     "文件没读完时返回续读 offset。",
         {"path": {"type": "string"},
          "offset": {"type": "integer", "description": "起始字节，默认 0"},
          "max_bytes": {"type": "integer", "description": "≤8192，默认 8192"}}, ["path"]),
+    _fn("edit_file", "修改已有文件的首选方式：把 old_string 精确替换为 new_string。"
+                     "old_string 必须与文件内容逐字符一致且在文件中唯一（不要带行号前缀），"
+                     "否则报错不写入。只改局部内容，不要整文件重写。",
+        {"path": {"type": "string"},
+         "old_string": {"type": "string", "description": "被替换的原文，需唯一"},
+         "new_string": {"type": "string", "description": "替换后的内容，可为空表示删除"},
+         "replace_all": {"type": "boolean", "description": "为 true 时替换全部匹配（默认 false）"}},
+        ["path", "old_string", "new_string"]),
     _fn("write_file", "写文本文件，父目录自动创建。覆盖已有文件前会请求用户批准，追加或新建不请求。",
         {"path": {"type": "string"}, "content": {"type": "string"},
          "mode": {"type": "string", "enum": ["overwrite", "append"]}}, ["path", "content"]),
@@ -575,6 +695,10 @@ def chat(messages, cfg):
         raise ApiError(str(data["error"])[:600])
     if not data.get("choices"):
         raise ApiError("响应无 choices：" + raw[:300])
+    msg = (data["choices"][0] or {}).get("message") or {}
+    _usage(data.get("usage"), _chars(messages),
+           len(_text(msg)) + sum(len((c.get("function") or {}).get("arguments") or "")
+                                 for c in msg.get("tool_calls") or []))
     return data
 
 
@@ -582,6 +706,7 @@ def chat_stream(messages, cfg):
     """流式请求，边收边打印（思考段暗色）。返回 (正文, 工具调用)。"""
     text, calls, junk = [], {}, []
     seen = {"think": False, "text": False}
+    usage = None
     try:
         with _post(_payload(cfg, messages, True), cfg) as resp:
             for raw in resp:
@@ -599,6 +724,8 @@ def chat_stream(messages, cfg):
                     continue
                 if obj.get("error") and not obj.get("choices"):
                     raise ApiError(str(obj["error"])[:600])
+                if isinstance(obj.get("usage"), dict):
+                    usage = obj["usage"]   # 部分服务端在最后一个分片带用量
                 for ch in obj.get("choices") or []:
                     d = ch.get("delta") or {}
                     pieces = (
@@ -638,7 +765,10 @@ def chat_stream(messages, cfg):
     body = "".join(text)
     if not body.strip() and not calls and junk:
         raise ApiError("流式响应格式异常（服务端未按 SSE 返回）：" + "".join(junk)[:400])
-    return body, _norm_calls([calls[k] for k in sorted(calls)])
+    calls = _norm_calls([calls[k] for k in sorted(calls)])
+    _usage(usage, _chars(messages),
+           len(body) + sum(len(c["function"]["arguments"]) for c in calls))
+    return body, calls
 
 
 # ---------------------------------------------------------------- 上下文与轮次
@@ -847,6 +977,7 @@ def status(cfg):
                           if cfg["tools"] else "已禁用"),
         "确认策略 : %s" % ("全部自动批准（--yes）" if _AUTO_YES
                           else "仅高危命令需批准，普通命令直接执行"),
+        _usage_line(),
     ])
 
 
