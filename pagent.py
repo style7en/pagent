@@ -38,7 +38,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.8"
+VERSION = "0.0.9"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
@@ -199,7 +199,14 @@ def _usage(usage, in_chars, out_chars):
 
 
 def _tok(n, force_k=False):
-    return "%.1fk" % (n / 1000.0) if force_k or n >= 1000 else str(n)
+    """token 数转显示串：≥1024（或 force_k）按 1K=1024 换算，正好整 K 不带小数。
+
+    上下文窗口习惯用二进制单位：262144 = 256×1024，所以显示 256k 而不是 262.1k。
+    """
+    if not force_k and n < 1024:
+        return str(n)
+    k = n / 1024.0
+    return "%dk" % k if k == int(k) else "%.1fk" % k
 
 
 def _fixed_chars(cfg):

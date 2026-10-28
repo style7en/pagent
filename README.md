@@ -56,8 +56,8 @@ echo "这个项目是做什么的？" | python pagent.py
 | `PAGENT_BASE_URL` | 空 | 接口地址，如 `https://api.openai.com/v1` |
 | `PAGENT_WORKDIR` | 当前目录 | 工作目录（文件工具的沙箱根） |
 | `PAGENT_ALLOW_OUTSIDE` | 关 | 设为 `1` 放开工作目录限制 |
-| `PAGENT_CONTEXT_TOKENS` | `262144` | 上下文预算 |
-| `PAGENT_MAX_OUTPUT_TOKENS` | `32768` | 单次最大输出 |
+| `PAGENT_CONTEXT_TOKENS` | `262144`（256K） | 上下文预算 |
+| `PAGENT_MAX_OUTPUT_TOKENS` | `32768`（32K） | 单次最大输出 |
 | `PAGENT_TIMEOUT` | `300` | 单次请求超时（秒） |
 | `PAGENT_RETRIES` | `3` | 失败重试上限 |
 | `PAGENT_RETRIES_429` | `8` | 429 限流单独的重试上限 |
@@ -158,6 +158,7 @@ echo "这个项目是做什么的？" | python pagent.py
 - **用量与上下文占用**：`/status` 最后一行「用量」里同时给出请求次数、输入/输出 token，
   以及当前对话占窗口的百分比；「上下文」那行只放静态配置（窗口、裁剪阈值、最大输出）。
   计算时把每次请求固定携带的 tools schema 也算进去，数字和真实请求对得上。
+  token 数按 **1K=1024** 显示，所以 262144 显示为 `256k`，正好对上「256K 上下文」的说法。
   超过阈值时会标「已触发裁剪」，此时可 `/reset` 重来。
 - **emoji / 代理项**：服务端把 emoji 写成 `\ud83d\ude00` 这种转义时，JSON 解析出来是
   **两个孤立代理项**而不是一个字符，直接回传会抛
