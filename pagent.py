@@ -38,7 +38,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.4"
+VERSION = "0.0.5"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
@@ -1005,7 +1005,6 @@ def trim(messages, cfg):
       3) 仍超预算则丢弃最旧的完整 assistant(tool_calls)+tool 块，保留最后一块。
     """
     budget = _budget(cfg)
-    size = lambda ms: sum(len(json.dumps(m, ensure_ascii=False)) for m in ms)
 
     def find(start, pred):   # 从 start 起第一条满足 pred 的消息下标（可能为 len）
         i = start
@@ -1013,14 +1012,14 @@ def trim(messages, cfg):
             i += 1
         return i
 
-    used, dropped, blocks = size(messages), 0, 0
+    used, dropped, blocks = _chars(messages), 0, 0
 
     # 阶段 1：整轮裁剪
     while used > budget and len(messages) > 2:
         j = find(2, lambda m: m["role"] == "user")
         if j >= len(messages):
             break
-        used -= size(messages[1:j])
+        used -= _chars(messages[1:j])
         dropped += j - 1
         del messages[1:j]
     if dropped:
@@ -1040,7 +1039,7 @@ def trim(messages, cfg):
             if len(c) > keep:
                 m["content"] = c[:keep] + "\n...[已压缩 %d 字符以适配上下文预算]" % (len(c) - keep)
                 squeezed += 1
-        used = size(messages)
+        used = _chars(messages)
     if squeezed:
         print("[已压缩 %d 条工具结果以适配上下文预算]" % squeezed)
 
@@ -1050,7 +1049,7 @@ def trim(messages, cfg):
         j = find(i + 1, lambda m: m.get("role") != "tool")
         if i >= len(messages) or j >= len(messages):
             break
-        used -= size(messages[i:j])
+        used -= _chars(messages[i:j])
         del messages[i:j]
         blocks += 1
     if blocks:
