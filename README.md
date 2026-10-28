@@ -1,6 +1,6 @@
 # pagent
 
-一个零依赖的命令行编程 Agent，单文件 1300 余行，只依赖 Python 标准库。
+一个零依赖的命令行编程 Agent，只依赖 Python 标准库。
 对接任意 OpenAI 兼容的 `/chat/completions` 接口，能读写文件、搜索代码、执行命令。
 
 ```
