@@ -25,6 +25,7 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from contextlib import suppress
@@ -38,7 +39,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.10"
+VERSION = "0.0.11"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
@@ -78,16 +79,10 @@ DEFAULT_SYSTEM = (
     "write_file 覆盖已有文件同样会请求批准，追加或新建文件直接执行。"
     "被拒绝就换更安全的方案。"
     "任务不明确时先向用户澄清。任务完成后停止，用两三句话总结做了什么。"
-    "终端里不要用 markdown 管道表格（| a | b | 的竖线会原样打出来，列宽不受控，必然错位）。"
-    "出表格就整块放进代码块：第一行表头，每行用制表符分隔单元格。"
-    "制表符会自动跳到第 8、16、24…列，前提是每格显示宽度都小于 8 列"
-    "（汉字算 2 列，即最多 4 个汉字或 7 个英文字符）；"
-    "格子之间只放一个制表符，绝不要再补空格，补了反而错位；"
-    "表头写成 4 个汉字最整齐，列数控制在 5 列以内。"
-    "只要有一格超过 8 列，整张表就改用框线字符（┌ ┬ ┐ │ ├ ┼ ┤ └ ┴ ┘ ─）画，"
-    "按每列最宽的格子用空格补齐，肉眼齐即可。"
-    "需要分隔就画一行半角减号，需要汇总就在最后补一行合计。"
-    "表格一律手写，不要为了算列宽去写脚本或调用工具。"
+    "要出表格就直接写 markdown 管道表格（第一行表头，第二行是 |---| 分隔行），"
+    "pagent 会按显示宽度把它渲染成对齐的框线表格，列宽不用你操心，对齐标记 :---: 也认。"
+    "不要自己手画 ┌ ┬ ┐ 这类框线表，也不要用制表符或空格去凑对齐——手算列宽必然错位。"
+    "表格放进代码块里就只是普通文本、不会被渲染，只有直接写在正文里才会。"
     "始终用中文回答，回答简洁。不要编造工具结果。"
 )
 
@@ -949,10 +944,138 @@ def chat(messages, cfg):
     return data
 
 
+# ---------------------------------------------------------------- 表格渲染
+# 模型只写 markdown 管道表格，列宽和对齐交给这里算——让模型手画 ASCII 表必然错位：
+# 它算不准全角字符的宽度，行一多还会漏掉左右边框。
+
+_WIDE = ("W", "F")   # east_asian_width 的这两个值是全角，终端占 2 列
+_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def _w(s):
+    """字符串在终端里占几列（中日韩全角、多数 emoji 算 2 列）。"""
+    return sum(2 if unicodedata.east_asian_width(c) in _WIDE else 1 for c in s)
+
+
+def _is_row(line):
+    return line.strip().startswith("|") and line.count("|") >= 2
+
+
+def _cells(line):
+    """| a | b | → ['a', 'b']。"""
+    s = line.strip()
+    s = s[1:] if s.startswith("|") else s
+    s = s[:-1] if s.endswith("|") else s
+    return [c.strip() for c in s.split("|")]
+
+
+def _pad(s, width, align):
+    gap = width - _w(s)
+    if gap <= 0:
+        return s
+    if align == "right":
+        return " " * gap + s
+    if align == "center":
+        return " " * (gap // 2) + s + " " * (gap - gap // 2)
+    return s + " " * gap
+
+
+def _table_block(lines):
+    """把一段 markdown 表格行渲染成框线表格；不是表格（缺分隔行）返回 None。"""
+    if len(lines) < 2 or not _is_row(lines[0]) or not _SEP.match(lines[1]):
+        return None
+    head = _cells(lines[0])
+    n = len(head)
+    aligns = []
+    for c in _cells(lines[1])[:n]:
+        aligns.append("center" if c.startswith(":") and c.endswith(":") else
+                      "right" if c.endswith(":") else "left")
+    aligns += ["left"] * (n - len(aligns))
+    rows = []
+    for line in lines[2:]:
+        if not _is_row(line):
+            continue
+        cells = _cells(line)[:n]
+        rows.append(cells + [""] * (n - len(cells)))
+    width = [max([_w(head[i])] + [_w(r[i]) for r in rows]) for i in range(n)]
+
+    def bar(left, mid, right):
+        return left + mid.join("─" * (w + 2) for w in width) + right
+
+    out = [bar("┌", "┬", "┐")]
+    for i, row in enumerate([head] + rows):
+        out.append("│" + "│".join(" %s " % _pad(c, width[j], aligns[j])
+                                  for j, c in enumerate(row)) + "│")
+        if i == 0:
+            out.append(bar("├", "┼", "┤"))
+    out.append(bar("└", "┴", "┘"))
+    return "\n".join(out)
+
+
+def _render_tables(text):
+    """整段文本里的 markdown 表格转成框线表（``` 代码块内的不动）。"""
+    out, block, fence = [], [], False
+    for line in text.split("\n"):
+        if not fence and (_is_row(line) or (block and _SEP.match(line))):
+            block.append(line)
+            continue
+        if block:
+            out.append(_table_block(block) or "\n".join(block))
+            block = []
+        out.append(line)
+        if line.strip().startswith("```"):
+            fence = not fence
+    if block:
+        out.append(_table_block(block) or "\n".join(block))
+    return "\n".join(out)
+
+
+class _Out:
+    """流式打印：普通行立刻输出，疑似表格的行先攒着，等整块到齐再渲染。"""
+
+    def __init__(self):
+        self.buf, self.block, self.fence = "", [], False
+
+    def _emit(self, line):
+        sys.stdout.write(_clean(line) + "\n")
+
+    def _flush(self):
+        if not self.block:
+            return
+        box = _table_block(self.block)
+        sys.stdout.write((box or "\n".join(self.block)) + "\n")
+        self.block = []
+
+    def _line(self, line):
+        if not self.fence and (_is_row(line) or (self.block and _SEP.match(line))):
+            self.block.append(line)
+            return
+        self._flush()
+        self._emit(line)
+        if line.strip().startswith("```"):
+            self.fence = not self.fence
+
+    def feed(self, piece):
+        self.buf += piece
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            self._line(line)
+        sys.stdout.flush()
+
+    def close(self):
+        """收尾：吐完攒着的表格；最后半行不加换行，留给调用方补。"""
+        self._flush()
+        if self.buf:
+            sys.stdout.write(_clean(self.buf))
+            self.buf = ""
+        sys.stdout.flush()
+
+
 def chat_stream(messages, cfg):
     """流式请求，边收边打印（思考段暗色）。返回 (正文, 工具调用)。"""
     text, calls, junk = [], {}, []
     seen = {"think": False, "text": False}
+    out = _Out()
     usage = None
     try:
         with _post(_payload(cfg, messages, True), cfg) as resp:
@@ -989,8 +1112,11 @@ def chat_stream(messages, cfg):
                                 sys.stdout.write(_dim("\n· 思考: "))
                             elif seen["think"]:
                                 sys.stdout.write(("\033[0m" if _TTY else "") + "\n\n")
-                        sys.stdout.write(_dim(piece) if kind == "think" else _clean(piece))
-                        sys.stdout.flush()
+                        if kind == "think":
+                            sys.stdout.write(_dim(piece))
+                            sys.stdout.flush()
+                        else:
+                            out.feed(piece)
                         if kind == "text":
                             text.append(piece)
                     for tc in d.get("tool_calls") or []:
@@ -1005,7 +1131,9 @@ def chat_stream(messages, cfg):
                             slot["function"]["name"] += name   # 分片拼接，重发全名时不重复
                         slot["function"]["arguments"] += f.get("arguments") or ""
     except (OSError, http.client.HTTPException) as e:
+        out.close()
         raise ApiError("流式读取中断 — %s: %s（已输出部分内容）" % (type(e).__name__, e))
+    out.close()
     if seen["think"] or seen["text"]:
         sys.stdout.write(("\033[0m" if _TTY else "") + "\n\n")
         sys.stdout.flush()
@@ -1126,7 +1254,7 @@ def run_turn(messages, cfg):
             msg = (chat(messages, cfg).get("choices") or [{}])[0].get("message") or {}
             content, calls = _text(msg), _norm_calls(msg.get("tool_calls"))
             if content.strip():
-                print("\n" + content.strip() + "\n")
+                print("\n" + _render_tables(content.strip()) + "\n")
         entry = {"role": "assistant", "content": content or ""}
         if calls:
             entry["tool_calls"] = calls
