@@ -131,6 +131,10 @@ echo "这个项目是做什么的？" | python pagent.py
 - **编码**：子进程输出按 utf-8 → 系统编码 → gbk 依次尝试解码，中文 Windows 不乱码。
 - **用量统计**：累计每次请求的输入/输出 token（服务端返回 `usage` 就用真实值，
   流式响应没带时按字符数估算并标注），`/status` 里查看。
+- **emoji / 代理项**：服务端把 emoji 写成 `\ud83d\ude00` 这种转义时，JSON 解析出来是
+  **两个孤立代理项**而不是一个字符，直接回传会抛
+  `UnicodeEncodeError: surrogates not allowed`。收发两侧都会合并代理对、丢弃孤立项，
+  请求体编码再加一层 `errors="replace"` 兜底，这条路不会再崩。
 
 ## 已知限制
 

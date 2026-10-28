@@ -146,6 +146,39 @@ def _chars(messages):
     return sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
 
 
+def _clean(s):
+    """合并被拆开的代理对，丢弃孤立代理项。
+
+    服务端常把 emoji 写成 "\\ud83d\\ude00" 这种转义，json 解析出来是两个孤立代理项
+    而不是一个字符；拼接后既打印不出也 encode 不了，回传时直接抛
+    UnicodeEncodeError: surrogates not allowed。这里把它们合回真正的字符。
+    """
+    if not s or s.isascii():
+        return s
+    out, i, n = [], 0, len(s)
+    while i < n:
+        o = ord(s[i])
+        if 0xD800 <= o <= 0xDBFF and i + 1 < n and 0xDC00 <= ord(s[i + 1]) <= 0xDFFF:
+            out.append(chr(0x10000 + ((o - 0xD800) << 10) + (ord(s[i + 1]) - 0xDC00)))
+            i += 2
+            continue
+        if not 0xD800 <= o <= 0xDFFF:   # 孤立代理项直接丢弃
+            out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _clean_obj(o):
+    """递归清洗 payload 里的所有字符串，保证一定能 encode 成 utf-8。"""
+    if isinstance(o, str):
+        return _clean(o)
+    if isinstance(o, dict):
+        return {k: _clean_obj(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_clean_obj(v) for v in o]
+    return o
+
+
 def _usage(usage, in_chars, out_chars):
     """累计 token 用量。服务端回了 usage 就用真实值，否则按字符数估算。"""
     _USAGE["calls"] += 1
@@ -375,6 +408,7 @@ def _run_cmd(cmd, timeout):
 
 def tool_shell(a):
     cmd = a.get("command", "")
+    cmd = _clean(cmd) if isinstance(cmd, str) else cmd
     if not cmd.strip():
         return "错误：command 为空"
     reason = _risk(cmd)
@@ -475,13 +509,15 @@ def tool_write(a):
     if err:
         return err
     content = a.get("content", "")
+    if isinstance(content, str):
+        content = _clean(content)   # 模型可能回传孤立代理项，写文件前先修掉
     mode = "append" if a.get("mode") == "append" else "overwrite"
     if mode == "overwrite" and os.path.isfile(path):
         old = 0
         with suppress(OSError):
             old = os.path.getsize(path)
         if not _confirm("覆盖已有文件 %s（原 %d 字节 → 新 %d 字节）"
-                        % (path, old, len(str(content).encode("utf-8")))):
+                        % (path, old, len(str(content).encode("utf-8", "replace")))):
             return "用户拒绝了覆盖写入，文件未修改。可改用 mode=append 或询问用户。"
     try:
         parent = os.path.dirname(path)
@@ -491,7 +527,7 @@ def tool_write(a):
             f.write(content)
     except (OSError, TypeError) as e:
         return _err(e)
-    return "已写入 %d 字节到 %s（%s）" % (len(content.encode("utf-8")), path,
+    return "已写入 %d 字节到 %s（%s）" % (len(content.encode("utf-8", "replace")), path,
                                         "追加" if mode == "append" else "覆盖")
 
 
@@ -511,6 +547,7 @@ def tool_edit(a):
         return "错误：new_string 必须是字符串（删除内容请传空字符串）"
     if old == new:
         return "错误：old_string 与 new_string 相同，无需修改"
+    old, new = _clean(old), _clean(new)   # 模型回传的孤立代理项先修掉
     if not os.path.isfile(path):
         return "错误：文件不存在 %s（新建请用 write_file）" % path
     try:
@@ -662,7 +699,8 @@ def _net_error(e):
 def _post(payload, cfg):
     """返回已打开的 response。按错误码决定是否重试，429 用更高的重试上限。"""
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    # _clean_obj 清掉孤立代理项，errors="replace" 再兜一层，保证这里永远不会抛编码异常
+    body = json.dumps(_clean_obj(payload), ensure_ascii=False).encode("utf-8", "replace")
     limit, attempt, last = max(1, cfg["retries"]), 0, "请求失败"
     while True:
         attempt += 1
@@ -765,7 +803,7 @@ def chat_stream(messages, cfg):
                                 sys.stdout.write(_dim("\n· 思考: "))
                             elif seen["think"]:
                                 sys.stdout.write(("\033[0m" if _TTY else "") + "\n\n")
-                        sys.stdout.write(_dim(piece) if kind == "think" else piece)
+                        sys.stdout.write(_dim(piece) if kind == "think" else _clean(piece))
                         sys.stdout.flush()
                         if kind == "text":
                             text.append(piece)
@@ -785,7 +823,7 @@ def chat_stream(messages, cfg):
     if seen["think"] or seen["text"]:
         sys.stdout.write(("\033[0m" if _TTY else "") + "\n\n")
         sys.stdout.flush()
-    body = "".join(text)
+    body = _clean("".join(text))   # 拼接后可能有被分片拆散的代理对，先合回完整字符
     if not body.strip() and not calls and junk:
         raise ApiError("流式响应格式异常（服务端未按 SSE 返回）：" + "".join(junk)[:400])
     calls = _norm_calls([calls[k] for k in sorted(calls)])
@@ -860,9 +898,9 @@ def trim(messages, cfg):
 def _text(msg):
     c = msg.get("content")
     if isinstance(c, str):
-        return c
+        return _clean(c)
     if isinstance(c, list):
-        return "".join(p.get("text", "") for p in c if isinstance(p, dict))
+        return _clean("".join(p.get("text", "") for p in c if isinstance(p, dict)))
     return ""
 
 
@@ -890,7 +928,7 @@ def _norm_calls(calls):
         fn = c.get("function") or {}
         out.append({"id": c.get("id", ""), "type": "function",
                     "function": {"name": fn.get("name", "") or "",
-                                 "arguments": fn.get("arguments") or "{}"}})
+                                 "arguments": _clean(fn.get("arguments") or "{}")}})
     return out
 
 
