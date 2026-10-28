@@ -118,11 +118,9 @@ def _err(e):
 
 def _inside(path, root):
     root, real = os.path.realpath(root), os.path.realpath(path)
-    if os.path.normcase(real) == os.path.normcase(root):
-        return True
-    try:   # commonpath 正确处理盘符根（C:\ 或 /）与大小写差异
+    try:   # commonpath 按路径组件比较，正确处理盘符根（C:\ 或 /）与大小写差异
         return os.path.normcase(os.path.commonpath([root, real])) == os.path.normcase(root)
-    except ValueError:   # 不同盘符 / 混合绝对相对路径
+    except ValueError:   # 不同盘符
         return False
 
 
@@ -340,12 +338,13 @@ def tool_shell(a):
     return _clip("\n".join(parts))
 
 
-def _utf8_prefix(raw):
-    """解码字节前缀；末尾若切在多字节字符中间则回退。返回 (text, consumed)。"""
+def _utf8_prefix(raw, cut):
+    """解码字节前缀，返回 (text, consumed)。cut=分片截断时，末尾若切在多字节字符
+    中间则回退到字符起点；cut=已读到文件末尾时，坏字节只 replace 不丢弃。"""
     try:
         return raw.decode("utf-8"), len(raw)
     except UnicodeDecodeError as e:
-        if len(raw) - e.start <= 3:
+        if cut and len(raw) - e.start <= 3:
             return raw[:e.start].decode("utf-8", "replace"), e.start
         return raw.decode("utf-8", "replace"), len(raw)
 
@@ -374,7 +373,7 @@ def tool_read(a):
         while skip < min(3, len(raw)) and (raw[skip] & 0xC0) == 0x80:
             skip += 1
         raw, offset = raw[skip:], offset + skip
-    text, consumed = _utf8_prefix(raw)
+    text, consumed = _utf8_prefix(raw, more)
     end = offset + consumed
     if more:
         text += "\n...[分片读取：字节 %d-%d / 共 %d，续读请传 offset=%d]" % (offset, end, total, end)
@@ -420,7 +419,7 @@ def tool_list(a):
     lines = []
     for e in entries:
         try:
-            lines.append(("d  " + e.name + "/") if e.is_dir()
+            lines.append(("d  %s/" % e.name) if e.is_dir()
                          else "%-10d %s" % (e.stat().st_size, e.name))
         except OSError:
             lines.append("?  " + e.name)
@@ -471,13 +470,14 @@ RETRY_CODES = (408, 409, 425, 429)
 
 
 def _friendly(code, detail):
+    detail = detail.strip()
     hint, low = HINTS.get(code, ""), detail.lower()
     if code == 400 and any(k in low for k in ("context_length", "maximum context length", "too long")):
         hint = "上下文超长，调小 PAGENT_CONTEXT_TOKENS 或 /reset"
     elif code == 429 and ("实名" in detail or "real-name" in low or "rpm" in low):
         hint += "（需实名认证才能提高 RPM）"
     msg = "HTTP %d" % code + (" — " + hint if hint else "")
-    return msg + ("\n" + detail.strip()[:600] if detail.strip() else "")
+    return msg + ("\n" + detail[:600] if detail else "")
 
 
 def _retry_after(e):
@@ -536,7 +536,7 @@ def _post(payload, cfg):
                 detail = e.read().decode("utf-8", "replace")
             last = _friendly(e.code, detail)
             if e.code == 429:   # 限流通常等一会儿就好，给更多次机会
-                limit = max(limit, cfg.get("retries_429") or limit)
+                limit = max(limit, cfg["retries_429"])
             if e.code not in RETRY_CODES and e.code < 500:
                 raise ApiError(last)
             wait = _backoff(attempt - 1, _retry_after(e))
@@ -653,13 +653,18 @@ def trim(messages, cfg):
     """
     budget = max(int((cfg["context"] - cfg["max_output"] - 512) * CHARS_PER_TOKEN), 4000)
     size = lambda ms: sum(len(json.dumps(m, ensure_ascii=False)) for m in ms)
+
+    def find(start, pred):   # 从 start 起第一条满足 pred 的消息下标（可能为 len）
+        i = start
+        while i < len(messages) and not pred(messages[i]):
+            i += 1
+        return i
+
     used, dropped, blocks = size(messages), 0, 0
 
     # 阶段 1：整轮裁剪
     while used > budget and len(messages) > 2:
-        j = 2
-        while j < len(messages) and messages[j]["role"] != "user":
-            j += 1
+        j = find(2, lambda m: m["role"] == "user")
         if j >= len(messages):
             break
         used -= size(messages[1:j])
@@ -671,35 +676,26 @@ def trim(messages, cfg):
     # 阶段 2：压缩工具结果
     tools = [m for m in messages
              if m.get("role") == "tool" and isinstance(m.get("content"), str)]
-    total = sum(len(m["content"]) for m in tools)
     squeezed = 0
-    if used > budget and total > 0:
+    if used > budget and tools:
+        total = sum(len(m["content"]) for m in tools)
         overhead = 80 * len(tools)   # 消息外壳（role/tool_call_id/JSON 结构）的固定开销
-        keep = int((total - (used - budget) - overhead) / len(tools))
-        keep = min(KEEP_TOOL_CHARS, max(KEEP_TOOL_CHARS_MIN, keep))
+        keep = min(KEEP_TOOL_CHARS, max(KEEP_TOOL_CHARS_MIN,
+                                        int((total - (used - budget) - overhead) / len(tools))))
         for m in tools:
             c = m["content"]
-            if len(c) <= keep:
-                continue
-            before = len(json.dumps(m, ensure_ascii=False))
-            m["content"] = c[:keep] + "\n...[已压缩 %d 字符以适配上下文预算]" % (len(c) - keep)
-            used -= before - len(json.dumps(m, ensure_ascii=False))
-            squeezed += 1
+            if len(c) > keep:
+                m["content"] = c[:keep] + "\n...[已压缩 %d 字符以适配上下文预算]" % (len(c) - keep)
+                squeezed += 1
+        used = size(messages)
     if squeezed:
         print("[已压缩 %d 条工具结果以适配上下文预算]" % squeezed)
 
     # 阶段 3：丢弃最旧的完整工具往返块（保留最后一块）
     while used > budget:
-        i = 2
-        while i < len(messages) and not (messages[i].get("role") == "assistant"
-                                         and messages[i].get("tool_calls")):
-            i += 1
-        if i >= len(messages):
-            break
-        j = i + 1
-        while j < len(messages) and messages[j].get("role") == "tool":
-            j += 1
-        if j >= len(messages):   # 最后一块，删掉会丢当前轮上下文
+        i = find(2, lambda m: m.get("role") == "assistant" and m.get("tool_calls"))
+        j = find(i + 1, lambda m: m.get("role") != "tool")
+        if i >= len(messages) or j >= len(messages):
             break
         used -= size(messages[i:j])
         del messages[i:j]
@@ -811,7 +807,7 @@ def load_config(args):
         sys.stderr.write("警告：最大输出(%d) >= 上下文(%d)，上下文预算将被压缩到最小档\n"
                          % (max_out, ctx))
     allow = args.allow_outside or \
-        str(_env("PAGENT_ALLOW_OUTSIDE", "")).strip().lower() in ("1", "true", "yes", "on")
+        _env("PAGENT_ALLOW_OUTSIDE", "").strip().lower() in ("1", "true", "yes", "on")
     retries = max(1, _env("PAGENT_RETRIES", 3, int))
     retries_429 = max(retries, _env("PAGENT_RETRIES_429", retries + RETRY_429_EXTRA, int))
     return {
@@ -836,8 +832,7 @@ def load_config(args):
 def status(cfg):
     key = cfg["api_key"]
     masked = key[:4] + "…" + key[-4:] if len(key) > 12 else "****"
-    defaults = cfg.get("defaults") or set()
-    mark = lambda k: "（默认）" if k in defaults else ""
+    mark = lambda k: "（默认）" if k in cfg["defaults"] else ""
     return "\n".join([
         "pagent %s" % VERSION,
         "工作目录 : %s（%s）" % (cfg["workdir"], "沙箱开启" if cfg["jail"] else "无限制"),
@@ -846,7 +841,7 @@ def status(cfg):
         "鉴权     : Bearer %s%s" % (masked, mark("key")),
         "上下文   : %d tokens / 最大输出 %d" % (cfg["context"], cfg["max_output"]),
         "请求     : 超时 %.0fs，最多尝试 %d 次（429 最多 %d 次），%s" % (
-            cfg["timeout"], cfg["retries"], cfg.get("retries_429", cfg["retries"]),
+            cfg["timeout"], cfg["retries"], cfg["retries_429"],
             "流式" if cfg["stream"] else "非流式"),
         "工具     : %s" % ("、".join(t["function"]["name"] for t in TOOLS)
                           if cfg["tools"] else "已禁用"),
@@ -907,7 +902,6 @@ def main(argv=None):
                 print("\n[已中断]")
                 return -1
             return -1 if _ctrl_c(True) else 0
-        _CTRL_C["n"] = 0
         return 0
 
     if not interactive:
@@ -932,11 +926,10 @@ def main(argv=None):
             if _ctrl_c(False):
                 return 0
             continue
+        _CTRL_C["n"] = 0   # 任何一次成功输入都重新计数
         if not line:
-            _CTRL_C["n"] = 0
             continue
         if line.startswith("/"):
-            _CTRL_C["n"] = 0
             if line in ("/exit", "/quit", "/q"):
                 return 0
             elif line == "/reset":
