@@ -19,10 +19,12 @@
 ## 快速开始
 
 ```bash
-# 1. 配置（三个变量，都支持命令行覆盖）
-export PAGENT_API_KEY="sk-xxxx"
-export PAGENT_MODEL="gpt-4o-mini"
-export PAGENT_BASE_URL="https://api.openai.com/v1"   # 用中转服务就换成自己的地址
+# 1. 配置：在同目录建 pagent.local.py（已在 .gitignore 中，密钥不会进仓库）
+cat > pagent.local.py <<'EOF'
+BASE_URL = "https://api.openai.com/v1"
+API_KEY = "sk-xxxx"
+MODEL = "gpt-4o-mini"
+EOF
 
 # 2. 交互模式
 python pagent.py
@@ -31,16 +33,24 @@ python pagent.py
 echo "这个项目是做什么的？" | python pagent.py
 ```
 
-也可以跳过环境变量，直接改 `pagent.py` 顶部的 `DEFAULT_API_KEY` / `DEFAULT_MODEL` /
-`DEFAULT_BASE_URL` 三行。优先级：**命令行参数 > 环境变量 > 代码内默认值**。
+配置优先级：**命令行参数 > 环境变量 `PAGENT_*` > `pagent.local.py` > 代码内 `DEFAULT_*`**。
+
+### ⚠️ 不要把密钥写进 pagent.py
+
+`pagent.py` 顶部的 `DEFAULT_API_KEY` / `DEFAULT_MODEL` / `DEFAULT_BASE_URL` 在仓库里
+**必须保持空串**。一旦填了真实密钥并提交，就会随公开仓库泄漏出去（删掉文件也没用，
+密钥仍留在 git 历史里）。
+
+仓库自带的 `.git/hooks/pre-commit` 会在提交时拦截这种情况，但它只在本机生效
+（`.git/hooks` 不随仓库分发），换机器克隆后需要重新放置。
 
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `PAGENT_API_KEY` | 空 | 必填，接口密钥 |
-| `PAGENT_MODEL` | 空 | 必填，模型名 |
-| `PAGENT_BASE_URL` | 空 | 必填，接口地址，如 `https://api.openai.com/v1` |
+| `PAGENT_API_KEY` | 空 | 接口密钥 |
+| `PAGENT_MODEL` | 空 | 模型名 |
+| `PAGENT_BASE_URL` | 空 | 接口地址，如 `https://api.openai.com/v1` |
 | `PAGENT_WORKDIR` | 当前目录 | 工作目录（文件工具的沙箱根） |
 | `PAGENT_ALLOW_OUTSIDE` | 关 | 设为 `1` 放开工作目录限制 |
 | `PAGENT_CONTEXT_TOKENS` | `262144` | 上下文预算 |

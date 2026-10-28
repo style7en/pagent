@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """pagent — 零依赖命令行 Agent，仅支持 OpenAI 兼容的 /chat/completions。
 
-配置优先级：命令行参数 > 环境变量 > 文件顶部 DEFAULT_* 常量。
+配置优先级：命令行参数 > 环境变量 > pagent.local.py > 文件顶部 DEFAULT_* 常量。
+（pagent.local.py 在 .gitignore 里，专门放密钥；仓库里的 DEFAULT_* 必须保持空串）
 环境变量：PAGENT_API_KEY、PAGENT_MODEL、PAGENT_BASE_URL、PAGENT_WORKDIR、PAGENT_ALLOW_OUTSIDE、
 PAGENT_CONTEXT_TOKENS(262144)、PAGENT_MAX_OUTPUT_TOKENS(32768)、PAGENT_TIMEOUT(300)、
 PAGENT_RETRIES(3)、PAGENT_RETRIES_429(比 PAGENT_RETRIES 多 5 次)。
@@ -29,7 +30,8 @@ from contextlib import suppress
 from email.utils import parsedate_to_datetime
 
 # ================================================================ 默认配置
-# 没设置对应环境变量时用这里的值，改这三行即可固定配置。
+# 这三行在仓库里必须保持空串！真实配置写进同目录的 pagent.local.py（已被 .gitignore 忽略），
+# 否则密钥会被提交到公开仓库。详见 README「配置」一节。
 DEFAULT_BASE_URL = ""  # 对应 PAGENT_BASE_URL
 DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
@@ -95,6 +97,25 @@ def _env(name, default=None, kind=str):
 def _die(msg):
     sys.stderr.write(msg + "\n")
     sys.exit(2)
+
+
+def _local_cfg():
+    """读同目录 pagent.local.py 里的 BASE_URL / API_KEY / MODEL（存在才读）。
+
+    密钥放这个文件而不是直接写 DEFAULT_*，是因为它在 .gitignore 里，
+    不会随 git add -A 被误提交到公开仓库。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pagent.local.py")
+    if not os.path.isfile(path):
+        return {}
+    ns = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            exec(compile(f.read(), path, "exec"), ns)
+    except Exception as e:
+        sys.stderr.write("警告：读取 %s 失败（%s: %s），已忽略\n" % (path, type(e).__name__, e))
+        return {}
+    return {k: ns.get(k) for k in ("BASE_URL", "API_KEY", "MODEL")}
 
 
 def _ctrl_c(cancelled):
@@ -904,18 +925,21 @@ def _rollback(messages):
 # ---------------------------------------------------------------- 入口
 
 def load_config(args):
-    """优先级：命令行参数 > 环境变量 > 文件顶部 DEFAULT_* 常量。"""
+    """优先级：命令行参数 > 环境变量 > pagent.local.py > 文件顶部 DEFAULT_* 常量。"""
+    local = _local_cfg()
     key_env, model_env = _env("PAGENT_API_KEY"), _env("PAGENT_MODEL")
     base_env = _env("PAGENT_BASE_URL")
-    key = key_env or DEFAULT_API_KEY
-    model = args.model or model_env or DEFAULT_MODEL
-    base_url = args.base_url or base_env or DEFAULT_BASE_URL
+    key = key_env or local.get("API_KEY") or DEFAULT_API_KEY
+    model = args.model or model_env or local.get("MODEL") or DEFAULT_MODEL
+    base_url = args.base_url or base_env or local.get("BASE_URL") or DEFAULT_BASE_URL
     key, model, base_url = key.strip(), model.strip(), base_url.strip()
     if not key or not model:
-        msg = ("缺少 API Key / 模型名。三种配置方式任选其一：\n"
-               "  1. 环境变量: PAGENT_API_KEY / PAGENT_MODEL\n"
-               "  2. 命令行  : --model 模型名（Key 只能走环境变量或方式 3）\n"
-               "  3. 改代码  : pagent.py 顶部的 DEFAULT_API_KEY / DEFAULT_MODEL")
+        msg = ("缺少 API Key / 模型名。四种配置方式任选其一：\n"
+               "  1. 本地文件: 在同目录建 pagent.local.py，写 API_KEY = \"...\" / MODEL = \"...\"（推荐）\n"
+               "  2. 环境变量: PAGENT_API_KEY / PAGENT_MODEL\n"
+               "  3. 命令行  : --model 模型名（Key 只能走方式 1/2/4）\n"
+               "  4. 改代码  : pagent.py 顶部的 DEFAULT_API_KEY / DEFAULT_MODEL"
+               "（注意别提交到仓库）")
         old = [k for k in ("OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL") if os.environ.get(k)]
         if old:
             msg += "\n  提示：检测到旧变量 %s，已不再读取，请改用 PAGENT_* 前缀" % "、".join(old)
@@ -923,7 +947,7 @@ def load_config(args):
     if any(ord(c) > 127 for c in key):
         _die("API Key 含非 ASCII 字符（复制时多半带进了中文或全角符号），请检查")
     if not base_url:
-        _die("未设置接口地址。请设置 PAGENT_BASE_URL（或改 pagent.py 顶部的 DEFAULT_BASE_URL），"
+        _die("未设置接口地址。请在 pagent.local.py 里写 BASE_URL，或设置 PAGENT_BASE_URL，"
              "例如 https://api.openai.com/v1")
     if not base_url.startswith(("http://", "https://")):
         _die("base_url 必须以 http:// 或 https:// 开头: %s" % base_url)
@@ -955,16 +979,23 @@ def load_config(args):
         "retries_429": retries_429,
         "stream": args.stream,
         "tools": not args.no_tools,
-        # 仅用于 status 提示：这些项取自代码内默认值而非环境变量/命令行
-        "defaults": {n for n, v in (("key", key_env), ("model", args.model or model_env),
-                                    ("base_url", args.base_url or base_env)) if not v},
+        # 仅用于 status 提示：每项配置最终来自哪一层
+        "sources": {
+            "key": "env" if key_env else ("local" if local.get("API_KEY") else "default"),
+            "model": "cli" if args.model else (
+                "env" if model_env else ("local" if local.get("MODEL") else "default")),
+            "base_url": "cli" if args.base_url else (
+                "env" if base_env else ("local" if local.get("BASE_URL") else "default")),
+        },
     }
 
 
 def status(cfg):
     key = cfg["api_key"]
     masked = key[:4] + "…" + key[-4:] if len(key) > 12 else "****"
-    mark = lambda k: "（默认）" if k in cfg["defaults"] else ""
+    src = cfg["sources"]
+    mark = lambda k: {"cli": "（命令行）", "env": "", "local": "（本地文件）",
+                      "default": "（代码默认值）"}[src[k]]
     return "\n".join([
         "pagent %s" % VERSION,
         "工作目录 : %s（%s）" % (cfg["workdir"], "沙箱开启" if cfg["jail"] else "无限制"),
