@@ -37,7 +37,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
