@@ -424,6 +424,8 @@ def tool_read(a):
         return _err(e)
     if offset > total:
         return "错误：offset=%d 超出文件大小 %d" % (offset, total)
+    if total == 0:
+        return "（空文件，0 字节）"
     try:
         with open(path, "rb") as f:
             f.seek(offset)
