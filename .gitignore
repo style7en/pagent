@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 本地备份
+*.bak
+*.bak*
+
+# 工具本地数据
+.workbuddy-ai/
