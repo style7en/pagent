@@ -37,7 +37,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
@@ -196,6 +196,30 @@ def _usage(usage, in_chars, out_chars):
 
 def _tok(n):
     return "%.1fk" % (n / 1000.0) if n >= 1000 else str(n)
+
+
+def _fixed_chars(cfg):
+    """每次请求都固定带着的 tools schema 字符数（不随对话增长）。"""
+    return len(json.dumps(TOOLS, ensure_ascii=False)) if cfg["tools"] else 0
+
+
+def _budget(cfg):
+    """上下文预算（字符数）：扣掉输出预留和 tools schema，trim() 与状态显示共用。"""
+    return max(int((cfg["context"] - cfg["max_output"] - 512) * CHARS_PER_TOKEN)
+               - _fixed_chars(cfg), 4000)
+
+
+def _ctx_line(messages, cfg):
+    """当前对话占用上下文的百分比（按字符估算，口径与 trim() 一致）。"""
+    ctx, out = cfg["context"], cfg["max_output"]
+    if not messages:
+        return "上下文   : 窗口 %d tokens · 最大输出 %d" % (ctx, out)
+    used = (_chars(messages) + _fixed_chars(cfg)) // CHARS_PER_TOKEN
+    cap = _budget(cfg) // CHARS_PER_TOKEN
+    pct = used * 100.0 / ctx if ctx > 0 else 0.0
+    note = "，已触发裁剪" if used >= cap else ""
+    return "上下文   : 已用 %s / %d tokens（%s%%）· 裁剪阈值 %s%s · 最大输出 %d" % (
+        _tok(used), ctx, "%.2f" % pct if pct < 1 else "%.1f" % pct, _tok(cap), note, out)
 
 
 def _usage_line():
@@ -842,7 +866,7 @@ def trim(messages, cfg):
       2) 单轮内没有更早的 user 可丢时，按超额比例压缩所有工具结果；
       3) 仍超预算则丢弃最旧的完整 assistant(tool_calls)+tool 块，保留最后一块。
     """
-    budget = max(int((cfg["context"] - cfg["max_output"] - 512) * CHARS_PER_TOKEN), 4000)
+    budget = _budget(cfg)
     size = lambda ms: sum(len(json.dumps(m, ensure_ascii=False)) for m in ms)
 
     def find(start, pred):   # 从 start 起第一条满足 pred 的消息下标（可能为 len）
@@ -1028,7 +1052,7 @@ def load_config(args):
     }
 
 
-def status(cfg):
+def status(cfg, messages=None):
     key = cfg["api_key"]
     masked = key[:4] + "…" + key[-4:] if len(key) > 12 else "****"
     src = cfg["sources"]
@@ -1040,7 +1064,7 @@ def status(cfg):
         "Provider : %s%s" % (cfg["base_url"], mark("base_url")),
         "模型     : %s%s" % (cfg["model"], mark("model")),
         "鉴权     : Bearer %s%s" % (masked, mark("key")),
-        "上下文   : %d tokens / 最大输出 %d" % (cfg["context"], cfg["max_output"]),
+        _ctx_line(messages, cfg),
         "请求     : 超时 %.0fs，最多尝试 %d 次（429 最多 %d 次），%s" % (
             cfg["timeout"], cfg["retries"], cfg["retries_429"],
             "流式" if cfg["stream"] else "非流式"),
@@ -1107,7 +1131,7 @@ def main(argv=None):
         return 0
 
     if not interactive:
-        sys.stderr.write(status(cfg) + "\n\n")
+        sys.stderr.write(status(cfg, messages) + "\n\n")
         line = sys.stdin.read().strip()
         if not line:
             sys.stderr.write("stdin 为空\n")
@@ -1115,7 +1139,7 @@ def main(argv=None):
         rc = submit(line)
         return 0 if rc < 0 else rc
 
-    print(status(cfg))
+    print(status(cfg, messages))
     print("\n命令: /status 状态  /exit 退出  /reset 清空历史  /tools 工具"
           "（Ctrl+C 连按 %d 次也可退出）\n" % QUIT_AT)
     while True:
@@ -1138,7 +1162,7 @@ def main(argv=None):
                 messages = [{"role": "system", "content": notice}]
                 print("[历史已清空]\n")
             elif line == "/status":
-                print(status(cfg) + "\n")
+                print(status(cfg, messages) + "\n")
             elif line == "/tools":
                 print(("\n".join("- %s: %s" % (t["function"]["name"], t["function"]["description"])
                                  for t in TOOLS) + "\n") if cfg["tools"] else "工具已禁用\n")

@@ -79,7 +79,7 @@ echo "这个项目是做什么的？" | python pagent.py
 
 | 命令 | 作用 |
 |---|---|
-| `/status` | 查看当前配置与本次会话的 token 用量 |
+| `/status` | 查看当前配置、token 用量与上下文占用百分比 |
 | `/reset` | 清空对话历史 |
 | `/tools` | 列出可用工具 |
 | `/exit` | 退出（`/quit`、`/q` 同义） |
@@ -131,6 +131,9 @@ echo "这个项目是做什么的？" | python pagent.py
 - **编码**：子进程输出按 utf-8 → 系统编码 → gbk 依次尝试解码，中文 Windows 不乱码。
 - **用量统计**：累计每次请求的输入/输出 token（服务端返回 `usage` 就用真实值，
   流式响应没带时按字符数估算并标注），`/status` 里查看。
+- **上下文占用**：`/status` 显示当前对话占窗口的百分比、裁剪阈值，
+  并把每次请求固定携带的 tools schema 也算进去，数字和真实请求对得上。
+  超过阈值时会标「已触发裁剪」，此时可 `/reset` 重来。
 - **emoji / 代理项**：服务端把 emoji 写成 `\ud83d\ude00` 这种转义时，JSON 解析出来是
   **两个孤立代理项**而不是一个字符，直接回传会抛
   `UnicodeEncodeError: surrogates not allowed`。收发两侧都会合并代理对、丢弃孤立项，
