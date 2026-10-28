@@ -39,7 +39,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.11"
+VERSION = "0.0.12"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
@@ -79,10 +79,6 @@ DEFAULT_SYSTEM = (
     "write_file 覆盖已有文件同样会请求批准，追加或新建文件直接执行。"
     "被拒绝就换更安全的方案。"
     "任务不明确时先向用户澄清。任务完成后停止，用两三句话总结做了什么。"
-    "要出表格就直接写 markdown 管道表格（第一行表头，第二行是 |---| 分隔行），"
-    "pagent 会按显示宽度把它渲染成对齐的框线表格，列宽不用你操心，对齐标记 :---: 也认。"
-    "不要自己手画 ┌ ┬ ┐ 这类框线表，也不要用制表符或空格去凑对齐——手算列宽必然错位。"
-    "表格放进代码块里就只是普通文本、不会被渲染，只有直接写在正文里才会。"
     "始终用中文回答，回答简洁。不要编造工具结果。"
 )
 
@@ -950,6 +946,7 @@ def chat(messages, cfg):
 
 _WIDE = ("W", "F")   # east_asian_width 的这两个值是全角，终端占 2 列
 _SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$")
+_BAR = re.compile(r"(?<!\\)\|")   # 单元格里的竖线会被模型写成 \|，不能当分隔符
 
 
 def _w(s):
@@ -962,11 +959,12 @@ def _is_row(line):
 
 
 def _cells(line):
-    """| a | b | → ['a', 'b']。"""
+    """| a | b | → ['a', 'b']；单元格里的 \\| 还原成竖线。"""
     s = line.strip()
     s = s[1:] if s.startswith("|") else s
-    s = s[:-1] if s.endswith("|") else s
-    return [c.strip() for c in s.split("|")]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip().replace("\\|", "|") for c in _BAR.split(s)]
 
 
 def _pad(s, width, align):
