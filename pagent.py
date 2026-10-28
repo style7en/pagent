@@ -38,7 +38,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.7"
+VERSION = "0.0.8"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
@@ -213,27 +213,31 @@ def _budget(cfg):
                - _fixed_chars(cfg), 4000)
 
 
-def _ctx_line(messages, cfg):
-    """当前对话占用上下文的百分比（按字符估算，口径与 trim() 一致）。"""
-    ctx, out = cfg["context"], cfg["max_output"]
+def _ctx_line(cfg):
+    """上下文配置（静态）：窗口、裁剪阈值、最大输出。"""
+    return "上下文   : 窗口 %s tokens · 裁剪阈值 %s · 最大输出 %s" % (
+        _tok(cfg["context"], True), _tok(_budget(cfg) // CHARS_PER_TOKEN, True),
+        _tok(cfg["max_output"], True))
+
+
+def _usage_line(messages, cfg):
+    """用量（动态）：请求数、输入输出 token、当前上下文已用与占比。"""
+    u = _USAGE
+    if u["calls"]:
+        head = "%d 次请求，输入 %s / 输出 %s tokens%s" % (
+            u["calls"], _tok(u["in"]), _tok(u["out"]),
+            "（其中 %d 次为估算）" % u["est"] if u["est"] else "")
+    else:
+        head = "本次会话还没有请求"
     if not messages:
-        return "上下文   : 窗口 %s tokens · 最大输出 %s" % (_tok(ctx, True), _tok(out, True))
+        return "用量     : " + head
     used = (_chars(messages) + _fixed_chars(cfg)) // CHARS_PER_TOKEN
     cap = _budget(cfg) // CHARS_PER_TOKEN
-    pct = used * 100.0 / ctx if ctx > 0 else 0.0
-    note = "，已触发裁剪" if used >= cap else ""
-    return "上下文   : 已用 %s，%s tokens（%s%%）· 裁剪阈值 %s%s · 最大输出 %s" % (
-        _tok(used, True), _tok(ctx, True),
-        "%.2f" % pct if pct < 1 else "%.1f" % pct, _tok(cap, True), note, _tok(out, True))
-
-
-def _usage_line():
-    u = _USAGE
-    if not u["calls"]:
-        return "用量     : 本次会话还没有请求"
-    return "用量     : %d 次请求，输入 %s / 输出 %s tokens%s" % (
-        u["calls"], _tok(u["in"]), _tok(u["out"]),
-        "（其中 %d 次为估算）" % u["est"] if u["est"] else "")
+    pct = used * 100.0 / cfg["context"] if cfg["context"] > 0 else 0.0
+    return "用量     : %s · 上下文已用 %s，%s（%s%%）%s" % (
+        head, _tok(used, True), _tok(cfg["context"], True),
+        "%.2f" % pct if pct < 1 else "%.1f" % pct,
+        "，已触发裁剪" if used >= cap else "")
 
 
 # ---------------------------------------------------------------- 路径沙箱
@@ -1204,7 +1208,7 @@ def status(cfg, messages=None):
         "Provider : %s%s" % (cfg["base_url"], mark("base_url")),
         "模型     : %s%s" % (cfg["model"], mark("model")),
         "鉴权     : Bearer %s%s" % (masked, mark("key")),
-        _ctx_line(messages, cfg),
+        _ctx_line(cfg),
         "请求     : 超时 %.0fs，最多尝试 %d 次（429 最多 %d 次），%s" % (
             cfg["timeout"], cfg["retries"], cfg["retries_429"],
             "流式" if cfg["stream"] else "非流式"),
@@ -1212,7 +1216,7 @@ def status(cfg, messages=None):
                           if cfg["tools"] else "已禁用"),
         "确认策略 : %s" % ("全部自动批准（--yes）" if _AUTO_YES
                           else "仅高危命令需批准，普通命令直接执行"),
-        _usage_line(),
+        _usage_line(messages, cfg),
     ])
 
 
