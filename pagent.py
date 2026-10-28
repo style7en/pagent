@@ -13,6 +13,7 @@ PAGENT_RETRIES(3)、PAGENT_RETRIES_429(比 PAGENT_RETRIES 多 5 次)。
 """
 
 import argparse
+import fnmatch
 import http.client
 import json
 import locale
@@ -37,13 +38,13 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
 KEEP_TOOL_CHARS_MIN = 400  # 压缩下限，保证工具结果仍有可用信息
 CHARS_PER_TOKEN = 3      # 1 token ≈ 3 字符（中英混合，偏保守）
-CHUNK = 8192             # read_file 分片字节数（默认=上限）
+CHUNK = 32768            # read_file 单次最多读多少字节（PAGENT_READ_CHUNK 可覆盖）
 QUIT_AT = 3              # 连按几次 Ctrl+C 才退出（QUIT_AT）
 
 # 重试退避（指数 + 抖动）：1, 2, 4, 8, 16, 32, 60... 秒
@@ -56,10 +57,11 @@ RETRY_AFTER_MAX = 120.0  # 服务端 Retry-After 的最大采纳值（秒）
 
 DEFAULT_SYSTEM = (
     "你是 pagent，一个极简的命令行编程 Agent。"
-    "你有五个工具：shell(执行命令)、read_file(分片读文件)、edit_file(精确替换)、"
-    "write_file(写文件/追加)、list_dir(列目录)。"
-    "read_file 每次最多读 8KB，返回续读 offset；输出带行号前缀（如 42→ 代码），"
-    "行号只为定位、不属于文件内容，抄进 old_string 时不要带行号。"
+    "你有六个工具：shell(执行命令)、search(正则搜索)、read_file(按行号或分片读)、"
+    "edit_file(精确替换)、write_file(写文件/追加)、list_dir(列目录)。"
+    "找东西先用 search 定位，拿到「文件:行号」后用 read_file 的 start_line/end_line 只读那一段，"
+    "不要从文件头一页页翻；确实要通读再按返回的 offset 续读（单次最多 32KB）。"
+    "read_file 输出带行号前缀（如 42→ 代码），行号只为定位、不属于文件内容，抄进 old_string 时不要带行号。"
     "改已有文件优先用 edit_file：old_string 必须与原文逐字符一致且在文件中唯一，"
     "只替换需要改的那一小段，不要整文件重写；匹配不到或不唯一时，重新 read_file "
     "取更长的上下文再试。新建文件或整篇重写才用 write_file。"
@@ -456,6 +458,72 @@ def tool_shell(a):
     return _clip("\n".join(parts))
 
 
+# ---------------------------------------------------------------- 文件搜索
+
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build",
+             ".idea", ".vscode", ".mypy_cache", ".pytest_cache", ".workbuddy-ai"}
+SCAN_LIMIT = 2_000_000   # 单文件超过 2MB 跳过，避免把二进制大文件读进内存
+
+
+def _iter_files(root, glob_pat):
+    """遍历待搜索的文件，跳过常见的无关目录。"""
+    if os.path.isfile(root):
+        yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for fn in sorted(filenames):
+            if not glob_pat or fnmatch.fnmatch(fn, glob_pat):
+                yield os.path.join(dirpath, fn)
+
+
+def tool_search(a):
+    """按正则搜文件内容，返回「文件:行号: 内容」。
+
+    让模型先定位再精读，避免为了找一处代码把整个大文件读一遍。
+    """
+    pat = a.get("pattern", "")
+    if not isinstance(pat, str) or not pat:
+        return "错误：pattern 为空"
+    try:
+        rx = re.compile(pat)
+    except re.error as e:
+        return "错误：正则无效 — %s" % e
+    root, err = _resolve(a.get("path", "."))
+    if err:
+        return err
+    glob_pat = a.get("glob") or ""
+    try:
+        limit = min(500, max(1, int(a.get("max_results", 100))))
+    except (TypeError, ValueError):
+        limit = 100
+    is_dir = os.path.isdir(root)
+    hits, scanned = [], 0
+    for path in _iter_files(root, glob_pat):
+        scanned += 1
+        try:
+            if os.path.getsize(path) > SCAN_LIMIT:
+                continue
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        if b"\x00" in raw[:4096]:   # 二进制文件跳过
+            continue
+        name = os.path.relpath(path, root) if is_dir else os.path.basename(path)
+        for i, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
+            if rx.search(line):
+                hits.append("%s:%d: %s" % (name, i, line.strip()[:300]))
+                if len(hits) >= limit:
+                    break
+        if len(hits) >= limit:
+            break
+    if not hits:
+        return "无匹配（扫描 %d 个文件）" % scanned
+    head = ("匹配过多，只显示前 %d 条" if len(hits) >= limit else "%d 处匹配") % len(hits)
+    return _clip("%s（扫描 %d 个文件）：\n%s" % (head, scanned, "\n".join(hits)))
+
+
 def _utf8_prefix(raw, cut):
     """解码字节前缀，返回 (text, consumed)。cut=分片截断时，末尾若切在多字节字符
     中间则回退到字符起点；cut=已读到文件末尾时，坏字节只 replace 不丢弃。"""
@@ -491,20 +559,78 @@ def _number(text, start):
     return "\n".join("%*d→ %s" % (width, start + i, ln) for i, ln in enumerate(lines)) + tail
 
 
+def _line_offset(f, line_no):
+    """第 line_no 行（1 起）的起始字节偏移；行号超出文件返回 None。"""
+    if line_no <= 1:
+        return 0
+    f.seek(0)
+    pos, cur = 0, 1
+    while cur < line_no:
+        row = f.readline()
+        if not row:
+            return None
+        pos += len(row)
+        cur += 1
+    return pos
+
+
+def _span(path, first, last):
+    """把行号区间换算成 (起始字节, 字节上限)；上限 None 表示一直到文件末尾。"""
+    with open(path, "rb") as f:
+        start = _line_offset(f, first)
+        if start is None:
+            return None
+        if last is None:
+            return start, None
+        end = _line_offset(f, last + 1)
+        return start, (None if end is None else max(1, end - start))
+
+
+def _chunk():
+    """单次读取的字节上限，可用 PAGENT_READ_CHUNK 调整。"""
+    try:
+        return max(1024, int(os.environ.get("PAGENT_READ_CHUNK") or CHUNK))
+    except ValueError:
+        return CHUNK
+
+
 def tool_read(a):
     path, err = _resolve(a.get("path", ""))
     if err:
         return err
     try:
         total = os.path.getsize(path)
-        offset = max(0, int(a.get("offset", 0)))
-        n = min(CHUNK, max(1, int(a.get("max_bytes", CHUNK))))
-    except (OSError, TypeError, ValueError) as e:
+    except OSError as e:
         return _err(e)
-    if offset > total:
-        return "错误：offset=%d 超出文件大小 %d" % (offset, total)
     if total == 0:
         return "（空文件，0 字节）"
+    chunk = _chunk()
+    first, last = a.get("start_line"), a.get("end_line")
+    if first is not None:   # 按行号读：search 拿到行号后直接定位，不必从文件头翻
+        try:
+            first = max(1, int(first))
+            last = None if last is None else int(last)
+        except (TypeError, ValueError):
+            return "错误：start_line / end_line 必须是整数"
+        if last is not None and last < first:
+            return "错误：end_line(%d) 小于 start_line(%d)" % (last, first)
+        try:
+            span = _span(path, first, last)
+        except OSError as e:
+            return _err(e)
+        if span is None:
+            return "错误：start_line=%d 超出文件行数" % first
+        offset, cap = span
+        n = chunk if cap is None else min(chunk, cap)
+    else:
+        cap = None
+        try:
+            offset = max(0, int(a.get("offset", 0)))
+            n = min(chunk, max(1, int(a.get("max_bytes", chunk))))
+        except (TypeError, ValueError) as e:
+            return _err(e)
+    if offset > total:
+        return "错误：offset=%d 超出文件大小 %d" % (offset, total)
     try:
         with open(path, "rb") as f:
             f.seek(offset)
@@ -512,6 +638,8 @@ def tool_read(a):
     except OSError as e:
         return _err(e)
     more, raw = len(raw) > n, raw[:n]
+    if cap is not None and n >= cap:
+        more = False   # 行号区间已整段覆盖，多读的那个探针字节不算"还有内容"
     if offset:   # offset 落在多字节字符中间：跳过残留续字节
         skip = 0
         while skip < min(3, len(raw)) and (raw[skip] & 0xC0) == 0x80:
@@ -522,9 +650,11 @@ def tool_read(a):
     if text:
         text = _number(text, _count_lines(path, offset) + 1)
     if more:
-        text += "\n...[分片读取：字节 %d-%d / 共 %d，续读请传 offset=%d]" % (offset, end, total, end)
+        text += "\n...[未读完：字节 %d-%d / 共 %d，续读请传 offset=%d]" % (offset, end, total, end)
+    elif end < total:
+        text += "\n...[已读到字节 %d / 共 %d，后面还有内容，续读请传 offset=%d]" % (end, total, end)
     elif offset:
-        text += "\n...[分片读取：字节 %d-%d，已到文件末尾]" % (offset, end)
+        text += "\n...[已到文件末尾]"
     return _clip(text)
 
 
@@ -621,8 +751,8 @@ def tool_list(a):
     return _clip("\n".join(lines) or "（空目录）")
 
 
-TOOL_IMPL = {"shell": tool_shell, "read_file": tool_read, "edit_file": tool_edit,
-             "write_file": tool_write, "list_dir": tool_list}
+TOOL_IMPL = {"shell": tool_shell, "search": tool_search, "read_file": tool_read,
+             "edit_file": tool_edit, "write_file": tool_write, "list_dir": tool_list}
 
 
 def _fn(name, desc, props=None, required=()):
@@ -635,11 +765,19 @@ TOOLS = [
     _fn("shell", "执行 shell 命令，返回 stdout/stderr/退出码。普通命令直接执行，仅高危命令会请求用户批准。",
         {"command": {"type": "string"},
          "timeout": {"type": "number", "description": "秒，默认 120"}}, ["command"]),
-    _fn("read_file", "分片读取文本文件，每次最多 8KB，输出带行号前缀（42→ 代码，行号不属于文件内容）。"
-                     "文件没读完时返回续读 offset。",
+    _fn("search", "在工作目录内按正则搜索文件内容，返回「文件:行号: 内容」。"
+                  "定位代码位置优先用它，不要整文件读；拿到行号后用 read_file 的 start_line/end_line 精读。",
+        {"pattern": {"type": "string", "description": "Python 正则表达式"},
+         "path": {"type": "string", "description": "目录或单个文件，默认 ."},
+         "glob": {"type": "string", "description": "文件名过滤，如 *.py"},
+         "max_results": {"type": "integer", "description": "默认 100，上限 500"}}, ["pattern"]),
+    _fn("read_file", "读文本文件。两种方式：① 按行号 start_line/end_line 精读（配合 search 最省）；"
+                     "② 按字节 offset 分片续读。输出带行号前缀（42→ 代码，行号不属于文件内容）。",
         {"path": {"type": "string"},
-         "offset": {"type": "integer", "description": "起始字节，默认 0"},
-         "max_bytes": {"type": "integer", "description": "≤8192，默认 8192"}}, ["path"]),
+         "start_line": {"type": "integer", "description": "起始行号，1 起"},
+         "end_line": {"type": "integer", "description": "结束行号（含），省略则读到末尾"},
+         "offset": {"type": "integer", "description": "按字节读时的起始字节，默认 0"},
+         "max_bytes": {"type": "integer", "description": "按字节读时的上限，默认 32768"}}, ["path"]),
     _fn("edit_file", "修改已有文件的首选方式：把 old_string 精确替换为 new_string。"
                      "old_string 必须与文件内容逐字符一致且在文件中唯一（不要带行号前缀），"
                      "否则报错不写入。只改局部内容，不要整文件重写。",

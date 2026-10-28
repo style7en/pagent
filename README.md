@@ -1,12 +1,15 @@
 # pagent
 
-一个零依赖的命令行编程 Agent，单文件 1000 余行，只依赖 Python 标准库。
-对接任意 OpenAI 兼容的 `/chat/completions` 接口，能读写文件、执行命令。
+一个零依赖的命令行编程 Agent，单文件 1300 余行，只依赖 Python 标准库。
+对接任意 OpenAI 兼容的 `/chat/completions` 接口，能读写文件、搜索代码、执行命令。
 
 ```
 > 帮我把 utils.py 里的重复函数合并一下
-→ read_file {"path": "utils.py"}
-→ edit_file {"path": "utils.py", "old_string": "def _parse_a(x):", "new_string": "def _parse(x):"}
+→ search {"pattern": "^def _parse", "glob": "*.py"}
+  utils.py:12: def _parse_a(x):
+  utils.py:31: def _parse_b(x):
+→ read_file {"path": "utils.py", "start_line": 12, "end_line": 45}
+→ edit_file {"path": "utils.py", "old_string": "def _parse_b(x):", "new_string": "def _parse(x):"}
 ...
 改完了：合并了 3 个重复的 _parse 函数，删掉了 42 行冗余代码。
 ```
@@ -58,6 +61,7 @@ echo "这个项目是做什么的？" | python pagent.py
 | `PAGENT_TIMEOUT` | `300` | 单次请求超时（秒） |
 | `PAGENT_RETRIES` | `3` | 失败重试上限 |
 | `PAGENT_RETRIES_429` | `8` | 429 限流单独的重试上限 |
+| `PAGENT_READ_CHUNK` | `32768` | `read_file` 单次读取的字节上限 |
 
 ## 命令行参数
 
@@ -90,15 +94,31 @@ echo "这个项目是做什么的？" | python pagent.py
 | 工具 | 说明 |
 |---|---|
 | `shell` | 执行 shell 命令，返回 stdout/stderr/退出码；超时会杀掉整个进程树 |
-| `read_file` | 分片读文件，每次最多 8KB，输出带行号前缀，返回续读 offset |
+| `search` | 按正则搜文件内容，返回 `文件:行号: 内容`；定位代码用它，不必整文件读 |
+| `read_file` | 读文件：按行号 `start_line`/`end_line` 精读，或按字节 `offset` 分片续读；输出带行号 |
 | `edit_file` | 精确替换：`old_string` → `new_string`，要求原文唯一，否则报错不写盘 |
 | `write_file` | 写文件，支持覆盖/追加，父目录自动创建 |
 | `list_dir` | 列目录，目录在前 |
 
+### 大文件怎么读
+
+单次读取上限默认 32KB（`PAGENT_READ_CHUNK` 可调）。但真正的成本不是字节数，而是**每次工具调用
+都要把完整历史重发一遍**，所以省调用的正确姿势是「先定位，再精读」：
+
+```
+→ search   {"pattern": "def handle_request", "glob": "*.py"}
+  server.py:128: def handle_request(req):
+→ read_file {"path": "server.py", "start_line": 120, "end_line": 160}
+```
+
+`search` 一次就能定位，`read_file` 只读那 40 行，两次调用搞定；换成从头分片翻，40KB 文件要 5 次。
+
+确实需要通读整个文件时，按返回的 `offset` 续读即可，尾部提示会说明「还有多少没读」。
+
 `read_file` 的输出形如：
 
 ```
-   44→ CHUNK = 8192             # read_file 分片字节数
+   44→ CHUNK = 32768            # read_file 单次最多读多少字节
    45→ QUIT_AT = 3              # 连按几次 Ctrl+C 才退出
 ```
 
