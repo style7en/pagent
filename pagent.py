@@ -21,6 +21,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -39,7 +40,7 @@ DEFAULT_API_KEY = ""  # 对应 PAGENT_API_KEY
 DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
-VERSION = "0.0.13"
+VERSION = "0.0.14"
 MAX_ROUNDS = 32          # 单轮工具往返上限
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
@@ -941,9 +942,14 @@ _SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$")
 _BAR = re.compile(r"(?<!\\)\|")   # 单元格里的竖线会被模型写成 \|，不能当分隔符
 
 
+def _cw(ch):
+    """单个字符的显示宽度：全角 2 列，其余 1 列。"""
+    return 2 if unicodedata.east_asian_width(ch) in _WIDE else 1
+
+
 def _w(s):
     """字符串在终端里占几列（中日韩全角、多数 emoji 算 2 列）。"""
-    return sum(2 if unicodedata.east_asian_width(c) in _WIDE else 1 for c in s)
+    return sum(_cw(c) for c in s)
 
 
 def _is_row(line):
@@ -970,7 +976,55 @@ def _pad(s, width, align):
     return s + " " * gap
 
 
-def _table_block(lines):
+def _avail():
+    """表格能占多少列：终端宽度减 1，读不到就按 80 算（COLUMNS 环境变量优先）。"""
+    return max(20, shutil.get_terminal_size((80, 24)).columns - 1)
+
+
+_CLOSE = "，。；：、！？）》」』】”’%"   # 这些标点不放在行首（避头尾）
+
+
+def _wrap(s, width):
+    """按显示宽度折行：不切开字符、标点不放行首、尽量在空格处断。"""
+    if width <= 0 or _w(s) <= width:
+        return [s]
+    out, cur, cur_w = [], "", 0
+    for ch in s:
+        n = _cw(ch)
+        if cur_w + n > width and cur:
+            k = cur.rfind(" ")
+            if k > 0 and _w(cur[:k]) > width * 0.45 and ch != " ":   # 优先在空格处断，别劈开英文单词
+                out.append(cur[:k])
+                cur = cur[k + 1:]
+            elif ch in _CLOSE and len(cur) > 1:   # 标点别落到下一行行首，把上一个字一起带下去
+                last = cur[-1]
+                out.append(cur[:-1])
+                cur = last
+            else:
+                out.append(cur)
+                cur = ""
+            cur_w = _w(cur)
+        cur += ch
+        cur_w += n
+    out.append(cur)
+    return [out[0]] + [l.lstrip() for l in out[1:]]
+
+
+def _fit(widths, avail):
+    """总宽超过 avail 就从最宽的列开始削，每列保底 6 列；实在放不下就让它溢出。"""
+    n = len(widths)
+    if sum(widths) + 3 * n + 1 <= avail:
+        return widths
+    w = list(widths)
+    while sum(w) + 3 * n + 1 > avail:
+        i = w.index(max(w))
+        if w[i] <= 6:
+            break
+        w[i] -= 1
+    return w
+
+
+def _table_block(lines, avail=None):
     """把一段 markdown 表格行渲染成框线表格；不是表格（缺分隔行）返回 None。"""
     if len(lines) < 2 or not _is_row(lines[0]) or not _SEP.match(lines[1]):
         return None
@@ -987,17 +1041,29 @@ def _table_block(lines):
             continue
         cells = _cells(line)[:n]
         rows.append(cells + [""] * (n - len(cells)))
-    width = [max([_w(head[i])] + [_w(r[i]) for r in rows]) for i in range(n)]
+    width = _fit([max([_w(head[i])] + [_w(r[i]) for r in rows]) for i in range(n)],
+                 avail or _avail())
 
     def bar(left, mid, right):
         return left + mid.join("─" * (w + 2) for w in width) + right
 
-    out = [bar("┌", "┬", "┐")]
-    for i, row in enumerate([head] + rows):
-        out.append("│" + "│".join(" %s " % _pad(c, width[j], aligns[j])
-                                  for j, c in enumerate(row)) + "│")
-        if i == 0:
+    def render(row):
+        """一行数据按列折行后，展开成若干条带边框的文本行。"""
+        cells = [_wrap(c, width[j]) for j, c in enumerate(row)]
+        out = []
+        for k in range(max(len(c) for c in cells)):
+            out.append("│" + "│".join(
+                " %s " % _pad(cells[j][k] if k < len(cells[j]) else "", width[j], aligns[j])
+                for j in range(n)) + "│")
+        return out
+
+    body = [render(row) for row in rows]
+    wrapped = any(len(b) > 1 for b in body)   # 有折行就在数据行之间加分隔线
+    out = [bar("┌", "┬", "┐")] + render(head) + [bar("├", "┼", "┤")]
+    for i, b in enumerate(body):
+        if wrapped and i:
             out.append(bar("├", "┼", "┤"))
+        out.extend(b)
     out.append(bar("└", "┴", "┘"))
     return "\n".join(out)
 
