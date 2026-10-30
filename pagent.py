@@ -41,7 +41,8 @@ DEFAULT_MODEL = ""  # 对应 PAGENT_MODEL
 # ================================================================
 
 VERSION = "0.0.15"
-MAX_ROUNDS = 32          # 单轮工具往返上限
+MAX_ROUNDS = 256         # 单轮工具往返上限（PAGENT_MAX_ROUNDS / --max-rounds 可覆盖）
+REPEAT_LIMIT = 3         # 同一工具调用连续重复几次判定为卡住（PAGENT_REPEAT_LIMIT）
 OUT_LIMIT = 60000        # 单条工具结果最大字符数
 KEEP_TOOL_CHARS = 2000   # 上下文超预算时，工具结果压缩后保留的字符数上限
 KEEP_TOOL_CHARS_MIN = 400  # 压缩下限，保证工具结果仍有可用信息
@@ -1301,8 +1302,18 @@ def _norm_calls(calls):
     return out
 
 
+def _sig(calls):
+    """一批工具调用的指纹，用于识别模型原样重发同一组调用的卡死行为。"""
+    return "\n".join(
+        "%s %s" % ((c.get("function") or {}).get("name", ""),
+                   (c.get("function") or {}).get("arguments") or "{}")
+        for c in calls)
+
+
 def run_turn(messages, cfg):
-    for _ in range(MAX_ROUNDS):
+    limit, repeat = cfg["max_rounds"], cfg["repeat_limit"]
+    last, streak = None, 0
+    for _ in range(limit):
         trim(messages, cfg)
         if cfg["stream"]:
             content, calls = chat_stream(messages, cfg)
@@ -1317,10 +1328,19 @@ def run_turn(messages, cfg):
         messages.append(entry)
         if not calls:
             return
+        sig = _sig(calls)
+        streak = streak + 1 if sig == last else 1
+        last = sig
+        if streak >= repeat:
+            for call in calls:   # 补齐配对，避免残留悬空 tool_calls
+                messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
+                                 "content": "（已跳过：与前几次完全相同的调用）"})
+            print("[相同工具调用已连续重复 %d 次，判定为卡住，已停止]" % streak)
+            return
         for call in calls:
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
                              "content": _run_tool(call)})
-    print("[达到工具调用轮数上限 %d，已停止]" % MAX_ROUNDS)
+    print("[达到工具调用轮数上限 %d，已停止]" % limit)
 
 
 def _rollback(messages):
@@ -1373,6 +1393,11 @@ def load_config(args):
         _env("PAGENT_ALLOW_OUTSIDE", "").strip().lower() in ("1", "true", "yes", "on")
     retries = max(1, _env("PAGENT_RETRIES", 3, int))
     retries_429 = max(retries, _env("PAGENT_RETRIES_429", retries + RETRY_429_EXTRA, int))
+    max_rounds = (args.max_rounds if args.max_rounds is not None
+                  else _env("PAGENT_MAX_ROUNDS", MAX_ROUNDS, int))
+    repeat_limit = _env("PAGENT_REPEAT_LIMIT", REPEAT_LIMIT, int)
+    if max_rounds <= 0:
+        _die("最大工具轮数必须是正整数")
     return {
         "workdir": workdir,
         "jail": not allow,
@@ -1382,6 +1407,8 @@ def load_config(args):
         "context": ctx,
         "max_output": max_out,
         "timeout": float(_env("PAGENT_TIMEOUT", 300, int)),
+        "max_rounds": max_rounds,
+        "repeat_limit": max(2, repeat_limit),
         "retries": retries,
         "retries_429": retries_429,
         "stream": args.stream,
@@ -1410,6 +1437,8 @@ def status(cfg, messages=None):
         "模型     : %s%s" % (cfg["model"], mark("model")),
         "鉴权     : Bearer %s%s" % (masked, mark("key")),
         _ctx_line(cfg),
+        "轮次     : 最多 %d 轮工具往返，同一调用连续 %d 次即停" % (
+            cfg["max_rounds"], cfg["repeat_limit"]),
         "请求     : 超时 %.0fs，最多尝试 %d 次（429 最多 %d 次），%s" % (
             cfg["timeout"], cfg["retries"], cfg["retries_429"],
             "流式" if cfg["stream"] else "非流式"),
@@ -1427,6 +1456,8 @@ def main(argv=None):
     p.add_argument("--model", help="覆盖 PAGENT_MODEL / DEFAULT_MODEL")
     p.add_argument("--context", type=int, help="上下文 token 预算")
     p.add_argument("--max-output", type=int, help="单次最大输出 token")
+    p.add_argument("--max-rounds", type=int,
+                   help="单轮工具往返上限（默认 %d）" % MAX_ROUNDS)
     p.add_argument("--system", help="系统提示词")
     p.add_argument("--workdir", help="工作目录（文件工具沙箱根，默认当前目录）")
     p.add_argument("--allow-outside", action="store_true", help="放开工作目录限制")

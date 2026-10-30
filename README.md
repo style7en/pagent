@@ -63,6 +63,8 @@ echo "这个项目是做什么的？" | python pagent.py
 | `PAGENT_RETRIES` | `3` | 失败重试上限 |
 | `PAGENT_RETRIES_429` | `8` | 429 限流单独的重试上限 |
 | `PAGENT_READ_CHUNK` | `32768` | `read_file` 单次读取的字节上限 |
+| `PAGENT_MAX_ROUNDS` | `256` | 单轮工具往返上限 |
+| `PAGENT_REPEAT_LIMIT` | `3` | 同一工具调用连续重复几次判定为卡住（最小 2） |
 
 ## 命令行参数
 
@@ -71,6 +73,7 @@ echo "这个项目是做什么的？" | python pagent.py
 --model NAME        覆盖模型名
 --context N         上下文 token 预算
 --max-output N      单次最大输出 token
+--max-rounds N      单轮工具往返上限（默认 256）
 --system TEXT       自定义系统提示词
 --workdir DIR       工作目录（沙箱根）
 --allow-outside     放开工作目录限制
@@ -195,6 +198,10 @@ echo "这个项目是做什么的？" | python pagent.py
   高危命令先申请、越界拒绝、中文简洁。`--system` 可整体替换。
 - **上下文裁剪**：超出预算时按「整轮丢弃 → 压缩工具结果 → 丢弃最旧工具往返块」三级处理，
   始终保证 `assistant/tool` 消息配对完整。
+- **轮次与卡死保护**：单轮最多 256 次工具往返（`--max-rounds` / `PAGENT_MAX_ROUNDS` 可调）。
+  同时按「名字 + 参数」给每轮工具调用算指纹，**连续**出现同一指纹 3 次即判定模型卡住并停止
+  （`PAGENT_REPEAT_LIMIT` 可调）；一旦换了调用就重新计数，因此读写交替的正常循环不会被误杀。
+  停止前会给这批调用补上占位 `tool` 消息，避免留下悬空配对导致下次请求 400。
 - **重试**：指数退避 + ±40% 随机抖动（1、2、4、8、16、32、60 秒封顶），
   优先采纳服务端返回的 `Retry-After`。429 默认给到 8 次机会。
 - **编码**：子进程输出按 utf-8 → 系统编码 → gbk 依次尝试解码，中文 Windows 不乱码。
